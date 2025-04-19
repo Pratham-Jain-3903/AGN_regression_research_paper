@@ -1,0 +1,10 @@
+numpy
+pandas
+scikit-learn
+seaborn
+matplotlib
+pycaret
+click
+reportlab
+
+#use python 3.10
