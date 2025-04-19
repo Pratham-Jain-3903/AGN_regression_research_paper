@@ -10,12 +10,12 @@ import os
 import logging
 from pathlib import Path
 from sklearn.impute import KNNImputer
-from sklearn.feature_selection import mutual_info_regression, RFE
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LassoCV
+from sklearn.feature_selection import mutual_info_regression, RFE, mutual_info_classif
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.linear_model import LassoCV, LogisticRegressionCV
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import RobustScaler
-from pycaret.regression import *
+from pycaret.classification import *  # Change to classification
 import click  # For CLI integration
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -23,6 +23,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import glob
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,7 +63,7 @@ def load_and_analyze_data(file_path):
         raise
 
 def visualize_data(df, target_col='target'):
-    """Generate enhanced visualizations with interactive elements"""
+    """Generate enhanced visualizations for classification"""
     try:
         # Verify target column exists
         if target_col not in df.columns:
@@ -81,10 +82,16 @@ def visualize_data(df, target_col='target'):
         fig = plt.figure(figsize=(20, 15))
         gs = fig.add_gridspec(3, 4)
         
-        # Target distribution
+        # Target distribution for classification
         ax1 = fig.add_subplot(gs[0, :])
-        sns.histplot(df[target_col], kde=True, ax=ax1)
-        ax1.set_title(f'Target Distribution (Skew: {df[target_col].skew():.2f})')
+        sns.countplot(data=df, x=target_col, ax=ax1)
+        ax1.set_title(f'Target Class Distribution')
+        
+        # Add class balance ratio
+        class_counts = df[target_col].value_counts()
+        balance_ratio = class_counts.min() / class_counts.max()
+        ax1.text(0.95, 0.95, f'Class Balance Ratio: {balance_ratio:.2f}', 
+                transform=ax1.transAxes, ha='right', va='top')
         
         # Feature distributions with outlier indicators
         for i, col in enumerate(numeric_cols[:4]):
@@ -121,7 +128,7 @@ def visualize_data(df, target_col='target'):
         raise
 
 class FeatureSelector:
-    """Advanced feature selection pipeline"""
+    """Advanced feature selection pipeline for classification"""
     def __init__(self, target_col='target'):
         self.target_col = target_col
         self.imputer = KNNImputer(n_neighbors=5)
@@ -149,27 +156,27 @@ class FeatureSelector:
             raise
     
     def select_features(self, X, y):
-        """Hybrid feature selection strategy"""
+        """Hybrid feature selection strategy for classification"""
         try:
             # Stage 1: Mutual Information Filter
-            mi_scores = mutual_info_regression(X, y)
+            mi_scores = mutual_info_classif(X, y)
             mi_threshold = np.median(mi_scores) * 1.5
             mi_mask = mi_scores > mi_threshold
             
-            # Stage 2: Embedded Method (LassoCV)
-            lasso = make_pipeline(RobustScaler(), LassoCV(cv=5))
-            lasso.fit(X, y)
-            lasso_mask = lasso.named_steps['lassocv'].coef_ != 0
+            # Stage 2: Embedded Method (LogisticRegressionCV)
+            logistic = make_pipeline(RobustScaler(), 
+                                   LogisticRegressionCV(cv=5, max_iter=1000))
+            logistic.fit(X, y)
+            logistic_mask = logistic.named_steps['logisticregressioncv'].coef_[0] != 0
             
             # Stage 3: Recursive Feature Elimination
-            combined_mask = mi_mask & lasso_mask
+            combined_mask = mi_mask & logistic_mask
             X_filtered = X.loc[:, combined_mask]
             
-            # Calculate number of features to select
             n_features_to_select = max(1, int(X_filtered.shape[1] * 0.5))
             
             rfe = RFE(
-                estimator=RandomForestRegressor(n_estimators=50, random_state=42),
+                estimator=RandomForestClassifier(n_estimators=50, random_state=42),
                 n_features_to_select=n_features_to_select,
                 step=0.1
             )
@@ -189,7 +196,7 @@ class FeatureSelector:
             selection_report = pd.DataFrame({
                 'Feature': X.columns,
                 'MI_Score': mi_scores,
-                'Lasso_Selected': lasso_mask,
+                'Logistic_Selected': logistic_mask,
                 'RFE_Selected': rfe_support,
                 'RFE_Ranking': rfe_ranking
             }).sort_values('MI_Score', ascending=False)
@@ -212,7 +219,7 @@ class FeatureSelector:
             # Visualize selection process
             plt.figure(figsize=(12, 8))
             sns.scatterplot(data=report, x='MI_Score', y='RFE_Ranking',
-                           hue='RFE_Selected', size='Lasso_Selected',
+                           hue='RFE_Selected', size='Logistic_Selected',
                            palette='viridis', sizes=(50, 150))
             plt.title('Feature Selection Landscape')
             plt.xlabel('Mutual Information Score')
@@ -225,13 +232,13 @@ class FeatureSelector:
             raise
 
 class ModelTrainer:
-    """Enhanced model training with PyCaret and custom evaluations"""
+    """Enhanced model training with PyCaret for classification"""
     def __init__(self, target_col='target'):
         self.target_col = target_col
         self.best_models = []
         
     def setup_environment(self, data, selected_features=None):
-        """Configure PyCaret with advanced settings"""
+        """Configure PyCaret with classification settings"""
         try:
             if selected_features:
                 data = data[selected_features + [self.target_col]]
@@ -241,15 +248,13 @@ class ModelTrainer:
                 target=self.target_col,
                 session_id=42,
                 normalize=True,
-                transform_target=True,
                 remove_outliers=True,
                 outliers_threshold=0.05,
                 remove_multicollinearity=True,
                 multicollinearity_threshold=0.9,
-                log_experiment=False,  # Disable MLflow logging
-                experiment_name='agn_modeling',  # Remove experiment name
+                log_experiment=False,
+                experiment_name='agn_classification',
                 use_gpu=False
-                # silent=True  # Reduce output verbosity
             )
             
             return exp
@@ -259,13 +264,13 @@ class ModelTrainer:
             raise
     
     def train_models(self):
-        """Train and optimize multiple models"""
+        """Train and optimize classification models"""
         try:
             # Compare base models
-            top_models = compare_models(n_select=3, sort='R2', exclude=['catboost'])
+            top_models = compare_models(n_select=3, sort='AUC', exclude=['catboost'])
             
             # Model tuning and ensembling
-            tuned_models = [tune_model(m, optimize='R2') for m in top_models]
+            tuned_models = [tune_model(m, optimize='AUC') for m in top_models]
             blended = blend_models(tuned_models)
             stacked = stack_models(tuned_models)
             
@@ -282,20 +287,17 @@ class ModelTrainer:
             raise
     
     def save_model_artifacts(self, model, model_id):
-        """Save model artifacts and visualizations"""
+        """Save classification model artifacts and visualizations"""
         try:
-            # Save model
             save_model(model, f'models/model_{model_id}')
             
-            # Create viz/models directory if it doesn't exist
             Path("viz/models").mkdir(parents=True, exist_ok=True)
             
-            # Generate plots without display_format parameter
-            plot_types = ['feature', 'residuals', 'error', 'learning']
+            # Classification-specific plots
+            plot_types = ['feature', 'confusion_matrix', 'auc', 'pr']
             for plot_type in plot_types:
                 try:
                     plot_model(model, plot=plot_type, save=True)
-                    # Save the current figure
                     plt.savefig(f'viz/models/model_{model_id}_{plot_type}.png', 
                                bbox_inches='tight', dpi=300)
                     plt.close()
@@ -404,10 +406,29 @@ def main(train_path, test_path):
             else:
                 test_df = test_df[test_features]
                 
+                # Create evaluation metrics DataFrame
+                eval_metrics = pd.DataFrame()
+                
                 for i, model in enumerate(best_models, 1):
                     predictions = predict_model(model, data=test_df)
-                    predictions.to_csv(f'data/processed/test_predictions_model_{i}.csv')
-                    logging.info(f"Model {i} predictions saved")
+                    
+                    # Save predictions
+                    predictions.to_csv(f'predictions/test_predictions_model_{i}.csv')
+                    
+                    # Calculate and store metrics
+                    metrics = {
+                        'Model': f'model_{i}',
+                        'Accuracy': accuracy_score(predictions['y_true'], predictions['y_pred']),
+                        'AUC': roc_auc_score(predictions['y_true'], predictions['y_pred']),
+                        'F1': f1_score(predictions['y_true'], predictions['y_pred']),
+                        'Precision': precision_score(predictions['y_true'], predictions['y_pred']),
+                        'Recall': recall_score(predictions['y_true'], predictions['y_pred'])
+                    }
+                    eval_metrics = eval_metrics.append(metrics, ignore_index=True)
+                
+                # Save evaluation metrics
+                eval_metrics.to_csv('predictions/model_evaluation_metrics.csv', index=False)
+                logging.info("Model evaluation metrics saved")
         
         # Compile results into PDF
         compile_results_pdf()

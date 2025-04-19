@@ -2,7 +2,7 @@ import pytest
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from pipeline import (
+from pipeline_regression import (
     load_and_analyze_data, 
     visualize_data, 
     FeatureSelector, 

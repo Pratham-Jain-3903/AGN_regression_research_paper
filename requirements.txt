@@ -3,7 +3,7 @@ pandas
 scikit-learn
 seaborn
 matplotlib
-pycaret
+pycaret[full]
 click
 reportlab
 
