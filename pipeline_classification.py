@@ -23,7 +23,9 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import glob
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score, matthews_corrcoef
+from imblearn.metrics import geometric_mean_score
+from sklearn.calibration import calibration_curve
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -232,16 +234,68 @@ class FeatureSelector:
             raise
 
 class ModelTrainer:
-    """Enhanced model training with PyCaret for classification"""
+    """Enhanced model training with PyCaret for classification and imbalance handling"""
     def __init__(self, target_col='target'):
         self.target_col = target_col
         self.best_models = []
         
+    def analyze_class_imbalance(self, data):
+        """Analyze class distribution and recommend resampling strategy"""
+        try:
+            class_dist = data[self.target_col].value_counts()
+            imbalance_ratio = class_dist.min() / class_dist.max()
+            
+            # Create class distribution plot
+            plt.figure(figsize=(10, 6))
+            sns.barplot(x=class_dist.index, y=class_dist.values)
+            plt.title('Class Distribution')
+            plt.xlabel('Class')
+            plt.ylabel('Count')
+            plt.savefig('viz/eda/class_distribution.png')
+            plt.close()
+            
+            # Log imbalance statistics
+            logging.info(f"Class distribution: {class_dist.to_dict()}")
+            logging.info(f"Imbalance ratio: {imbalance_ratio:.3f}")
+            
+            # Recommend sampling strategy
+            if imbalance_ratio < 0.2:
+                return 'severe_imbalance'
+            elif imbalance_ratio < 0.5:
+                return 'moderate_imbalance'
+            else:
+                return 'mild_imbalance'
+                
+        except Exception as e:
+            logging.error(f"Failed to analyze class imbalance: {str(e)}")
+            raise
+    
     def setup_environment(self, data, selected_features=None):
-        """Configure PyCaret with classification settings"""
+        """Configure PyCaret with imbalance handling"""
         try:
             if selected_features:
                 data = data[selected_features + [self.target_col]]
+            
+            # Analyze imbalance
+            imbalance_severity = self.analyze_class_imbalance(data)
+            
+            # Configure fix_imbalance and fix_imbalance_method based on severity
+            fix_imbalance = False
+            fix_imbalance_method = None
+            
+            if imbalance_severity == 'severe_imbalance':
+                fix_imbalance = True
+                # Use SMOTEENN for severe imbalance (combines SMOTE and ENN)
+                fix_imbalance_method = 'smoteenn'
+                logging.info("Using SMOTEENN for severe class imbalance")
+            elif imbalance_severity == 'moderate_imbalance':
+                fix_imbalance = True
+                # Use SMOTE for moderate imbalance
+                fix_imbalance_method = 'smote'
+                logging.info("Using SMOTE for moderate class imbalance")
+            else:
+                # Use class weights for mild imbalance
+                logging.info("Using class weights for mild class imbalance")
             
             exp = setup(
                 data=data, 
@@ -252,6 +306,8 @@ class ModelTrainer:
                 outliers_threshold=0.05,
                 remove_multicollinearity=True,
                 multicollinearity_threshold=0.9,
+                fix_imbalance=fix_imbalance,
+                fix_imbalance_method=fix_imbalance_method,
                 log_experiment=False,
                 experiment_name='agn_classification',
                 use_gpu=False
@@ -264,19 +320,49 @@ class ModelTrainer:
             raise
     
     def train_models(self):
-        """Train and optimize classification models"""
+        """Train and optimize models with imbalance consideration"""
         try:
-            # Compare base models
-            top_models = compare_models(n_select=3, sort='AUC', exclude=['catboost'])
+            # Compare base models using appropriate metrics for imbalanced data
+            top_models = compare_models(
+                n_select=3,
+                sort='AUC',  # AUC is more robust for imbalanced datasets
+                exclude=['catboost'],
+                fold=5,
+                cross_validation=True
+            )
             
-            # Model tuning and ensembling
-            tuned_models = [tune_model(m, optimize='AUC') for m in top_models]
-            blended = blend_models(tuned_models)
-            stacked = stack_models(tuned_models)
+            # Model tuning with focus on minority class
+            tuned_models = []
+            for model in top_models:
+                tuned_model = tune_model(
+                    model,
+                    optimize='AUC',  # Can be changed to 'F1' or 'Kappa' for severe imbalance
+                    search_algorithm='optuna',
+                    early_stopping='AUC',
+                    customize_scoring={
+                        'F1': 'weighted',  # Use weighted F1 for imbalanced cases
+                        'Precision': 'weighted',
+                        'Recall': 'weighted'
+                    }
+                )
+                tuned_models.append(tuned_model)
+            
+            # Ensemble methods often handle imbalance better
+            blended = blend_models(
+                tuned_models,
+                method='soft',  # Use soft voting for probability calibration
+                weights=[1, 1, 1]  # Can be adjusted based on individual model performance
+            )
+            
+            stacked = stack_models(
+                tuned_models,
+                meta_model='lightgbm',  # LightGBM handles imbalance well
+                restack=True
+            )
             
             self.best_models = [blended, stacked] + tuned_models
             
-            # Generate model insights
+            # Generate model insights with focus on minority class performance
             for i, model in enumerate(self.best_models):
                 self.save_model_artifacts(model, i+1)
             
@@ -287,19 +373,43 @@ class ModelTrainer:
             raise
     
     def save_model_artifacts(self, model, model_id):
-        """Save classification model artifacts and visualizations"""
+        """Save model artifacts with focus on imbalance metrics"""
         try:
             save_model(model, f'models/model_{model_id}')
             
             Path("viz/models").mkdir(parents=True, exist_ok=True)
             
-            # Classification-specific plots
-            plot_types = ['feature', 'confusion_matrix', 'auc', 'pr']
+            # Classification plots with emphasis on class imbalance
+            plot_types = [
+                'feature',
+                'confusion_matrix',
+                'auc',
+                'pr',  # Precision-Recall curve is crucial for imbalanced data
+                'class_report',  # Detailed per-class metrics
+                'boundary',  # Decision boundary visualization
+                'learning',  # Learning curve to check for bias
+                'calibration'  # Probability calibration curve
+            ]
+            
             for plot_type in plot_types:
                 try:
-                    plot_model(model, plot=plot_type, save=True)
-                    plt.savefig(f'viz/models/model_{model_id}_{plot_type}.png', 
-                               bbox_inches='tight', dpi=300)
+                    plot_model(
+                        model,
+                        plot=plot_type,
+                        save=True,
+                        plot_kwargs={
+                            'display_format': None,
+                            'scale': 1.2,
+                            'plot_kwargs': {
+                                'figsize': (10, 6)
+                            }
+                        }
+                    )
+                    plt.savefig(
+                        f'viz/models/model_{model_id}_{plot_type}.png',
+                        bbox_inches='tight',
+                        dpi=300
+                    )
                     plt.close()
                 except Exception as e:
                     logging.warning(f"Could not generate {plot_type} plot: {str(e)}")
@@ -420,9 +530,12 @@ def main(train_path, test_path):
                         'Model': f'model_{i}',
                         'Accuracy': accuracy_score(predictions['y_true'], predictions['y_pred']),
                         'AUC': roc_auc_score(predictions['y_true'], predictions['y_pred']),
-                        'F1': f1_score(predictions['y_true'], predictions['y_pred']),
-                        'Precision': precision_score(predictions['y_true'], predictions['y_pred']),
-                        'Recall': recall_score(predictions['y_true'], predictions['y_pred'])
+                        'F1_weighted': f1_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
+                        'F1_macro': f1_score(predictions['y_true'], predictions['y_pred'], average='macro'),
+                        'Precision_weighted': precision_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
+                        'Recall_weighted': recall_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
+                        'Geometric_Mean': geometric_mean_score(predictions['y_true'], predictions['y_pred']),
+                        'Matthews_Corr': matthews_corrcoef(predictions['y_true'], predictions['y_pred'])
                     }
                     eval_metrics = eval_metrics.append(metrics, ignore_index=True)
                 
