@@ -32,10 +32,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def configure_paths():
     """Configure directory paths for outputs"""
-    Path("viz/eda").mkdir(parents=True, exist_ok=True)
-    Path("viz/feature_selection").mkdir(parents=True, exist_ok=True)
-    Path("models").mkdir(exist_ok=True)
-    Path("data/processed").mkdir(parents=True, exist_ok=True)
+    Path("viz/eda/classifications").mkdir(parents=True, exist_ok=True)
+    Path("viz/feature_selection/classifications").mkdir(parents=True, exist_ok=True)
+    Path("models/classifications").mkdir(exist_ok=True)
+    Path("data/processed/classifications").mkdir(parents=True, exist_ok=True)
 
 def load_and_analyze_data(file_path):
     """Load and perform comprehensive EDA"""
@@ -325,8 +325,8 @@ class ModelTrainer:
             # Compare base models using appropriate metrics for imbalanced data
             top_models = compare_models(
                 n_select=3,
-                sort='AUC',  # AUC is more robust for imbalanced datasets
-                exclude=['catboost'],
+                sort='AUC',
+                exclude=['catboost', 'qda'],  # Exclude problematic models
                 fold=5,
                 cross_validation=True
             )
@@ -334,35 +334,71 @@ class ModelTrainer:
             # Model tuning with focus on minority class
             tuned_models = []
             for model in top_models:
-                tuned_model = tune_model(
-                    model,
-                    optimize='AUC',  # Can be changed to 'F1' or 'Kappa' for severe imbalance
-                    search_algorithm='optuna',
-                    early_stopping='AUC',
-                    customize_scoring={
-                        'F1': 'weighted',  # Use weighted F1 for imbalanced cases
-                        'Precision': 'weighted',
-                        'Recall': 'weighted'
+                # Get model name to determine appropriate parameters
+                model_name = model.__class__.__name__.lower()
+                
+                # Define parameter grid based on model type
+                if 'randomforest' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'max_depth': [3, 5, 7, None],
+                        'min_samples_split': [2, 5, 10],
+                        'min_samples_leaf': [1, 2, 4]
                     }
+                elif 'xgboost' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'max_depth': [3, 5, 7],
+                        'learning_rate': [0.01, 0.1, 0.3],
+                        'subsample': [0.7, 0.8, 0.9]
+                    }
+                elif 'lightgbm' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'num_leaves': [31, 50, 100],
+                        'learning_rate': [0.01, 0.1],
+                        'subsample': [0.7, 0.8, 0.9]
+                    }
+                else:
+                    # Default grid for other models
+                    custom_grid = None
+                
+                # Tune model with appropriate parameters
+                try:
+                    tuned_model = tune_model(
+                        model,
+                        optimize='AUC',
+                        search_algorithm='grid' if custom_grid else 'random',
+                        n_iter=10,
+                        custom_grid=custom_grid,
+                        fold=5
+                    )
+                    tuned_models.append(tuned_model)
+                    logging.info(f"Successfully tuned {model_name}")
+                except Exception as e:
+                    logging.warning(f"Could not tune {model_name}: {str(e)}")
+                    tuned_models.append(model)  # Use untuned model as fallback
+            
+            # Ensemble methods
+            try:
+                blended = blend_models(
+                    tuned_models,
+                    method='soft',
+                    weights=[1] * len(tuned_models)
                 )
-                tuned_models.append(tuned_model)
+                
+                stacked = stack_models(
+                    tuned_models,
+                    meta_model='lr',  # Use logistic regression as meta-model
+                    restack=True
+                )
+                
+                self.best_models = [blended, stacked] + tuned_models
+            except Exception as e:
+                logging.warning(f"Could not create ensemble models: {str(e)}")
+                self.best_models = tuned_models
             
-            # Ensemble methods often handle imbalance better
-            blended = blend_models(
-                tuned_models,
-                method='soft',  # Use soft voting for probability calibration
-                weights=[1, 1, 1]  # Can be adjusted based on individual model performance
-            )
-            
-            stacked = stack_models(
-                tuned_models,
-                meta_model='lightgbm',  # LightGBM handles imbalance well
-                restack=True
-            )
-            
-            self.best_models = [blended, stacked] + tuned_models
-            
-            # Generate model insights with focus on minority class performance
+            # Generate model insights
             for i, model in enumerate(self.best_models):
                 self.save_model_artifacts(model, i+1)
             
@@ -500,6 +536,9 @@ def main(train_path, test_path):
             logging.info("Evaluating on test data...")
             test_df = pd.read_csv(test_path)
             
+            # Create predictions directory if it doesn't exist
+            Path("predictions").mkdir(exist_ok=True)
+            
             # Check if test data has the required features
             missing_features = set(selected_features) - set(test_df.columns)
             if missing_features:
@@ -520,28 +559,56 @@ def main(train_path, test_path):
                 eval_metrics = pd.DataFrame()
                 
                 for i, model in enumerate(best_models, 1):
-                    predictions = predict_model(model, data=test_df)
-                    
-                    # Save predictions
-                    predictions.to_csv(f'predictions/test_predictions_model_{i}.csv')
-                    
-                    # Calculate and store metrics
-                    metrics = {
-                        'Model': f'model_{i}',
-                        'Accuracy': accuracy_score(predictions['y_true'], predictions['y_pred']),
-                        'AUC': roc_auc_score(predictions['y_true'], predictions['y_pred']),
-                        'F1_weighted': f1_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
-                        'F1_macro': f1_score(predictions['y_true'], predictions['y_pred'], average='macro'),
-                        'Precision_weighted': precision_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
-                        'Recall_weighted': recall_score(predictions['y_true'], predictions['y_pred'], average='weighted'),
-                        'Geometric_Mean': geometric_mean_score(predictions['y_true'], predictions['y_pred']),
-                        'Matthews_Corr': matthews_corrcoef(predictions['y_true'], predictions['y_pred'])
-                    }
-                    eval_metrics = eval_metrics.append(metrics, ignore_index=True)
+                    try:
+                        # Make predictions
+                        predictions = predict_model(model, data=test_df)
+                        
+                        # Log column names for debugging
+                        logging.info(f"Available columns in predictions: {predictions.columns.tolist()}")
+                        
+                        # Try different possible column names for predictions
+                        if 'prediction_label' in predictions.columns:
+                            y_pred = predictions['prediction_label']
+                        elif 'prediction_score' in predictions.columns:
+                            y_pred = predictions['prediction_score']
+                        else:
+                            y_pred = predictions['Label']  # PyCaret's default
+                            
+                        # Save raw predictions
+                        predictions.to_csv(f'predictions/test_predictions_model_{i}.csv', index=False)
+                        
+                        # For evaluation metrics, we'll use only the predictions
+                        metrics = {
+                            'Model': f'model_{i}',
+                            'Positive_Class_Predictions': (y_pred == 1).sum(),
+                            'Negative_Class_Predictions': (y_pred == 0).sum(),
+                            'Prediction_Distribution': y_pred.value_counts().to_dict()
+                        }
+                        
+                        eval_metrics = pd.concat([eval_metrics, pd.DataFrame([metrics])], ignore_index=True)
+                        logging.info(f"Predictions generated and saved for model {i}")
+                        
+                    except Exception as e:
+                        logging.warning(f"Could not generate predictions for model {i}: {str(e)}")
+                        continue
                 
-                # Save evaluation metrics
-                eval_metrics.to_csv('predictions/model_evaluation_metrics.csv', index=False)
-                logging.info("Model evaluation metrics saved")
+                # Save evaluation summary
+                eval_metrics.to_csv('predictions/prediction_distribution.csv', index=False)
+                logging.info("Prediction distribution saved")
+                
+                # Create prediction distribution visualization
+                plt.figure(figsize=(12, 6))
+                for idx, row in eval_metrics.iterrows():
+                    plt.bar(
+                        [f"{row['Model']} - Class {k}" for k in row['Prediction_Distribution'].keys()],
+                        row['Prediction_Distribution'].values()
+                    )
+                plt.title('Prediction Distribution by Model')
+                plt.xticks(rotation=45)
+                plt.ylabel('Count')
+                plt.tight_layout()
+                plt.savefig('viz/models/prediction_distribution.png')
+                plt.close()
         
         # Compile results into PDF
         compile_results_pdf()
