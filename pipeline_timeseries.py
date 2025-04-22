@@ -15,7 +15,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LassoCV
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import RobustScaler
-from pycaret.regression import *
+from pycaret.time_series import *
 import click  # For CLI integration
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -33,12 +33,6 @@ def configure_paths():
     Path("viz/feature_selection").mkdir(parents=True, exist_ok=True)
     Path("models").mkdir(exist_ok=True)
     Path("data/processed").mkdir(parents=True, exist_ok=True)
-
-def configs_load_and_analyze_data():
-    """Configuration settings for the pipeline"""
-
-    pass
-
 
 def load_and_analyze_data(file_path):
     """Load and perform comprehensive EDA"""
@@ -231,31 +225,30 @@ class FeatureSelector:
             raise
 
 class ModelTrainer:
-    """Enhanced model training with PyCaret and custom evaluations"""
+    """Enhanced model training with PyCaret Time Series and custom evaluations"""
     def __init__(self, target_col='target'):
         self.target_col = target_col
         self.best_models = []
         
     def setup_environment(self, data, selected_features=None):
-        """Configure PyCaret with advanced settings"""
+        """Configure PyCaret with time series settings"""
         try:
             if selected_features:
                 data = data[selected_features + [self.target_col]]
             
+            # Note: For time series, include forecasting horizon (fh) and seasonal_period
             exp = setup(
                 data=data, 
                 target=self.target_col,
                 session_id=42,
+                fh=12,  # Forecast horizon (modify as needed)
+                seasonal_period=12,
+                fold=3,
                 normalize=True,
                 transform_target=True,
-                remove_outliers=True,
-                outliers_threshold=0.05,
-                remove_multicollinearity=True,
-                multicollinearity_threshold=0.9,
                 log_experiment=False,  # Disable MLflow logging
-                experiment_name='agn_modeling',  # Remove experiment name
+                experiment_name='agn_timeseries_modeling',
                 use_gpu=False
-                # silent=True  # Reduce output verbosity
             )
             
             return exp
@@ -265,19 +258,17 @@ class ModelTrainer:
             raise
     
     def train_models(self):
-        """Train and optimize multiple models"""
+        """Train and optimize multiple time series forecasting models"""
         try:
-            # Compare base models
-            top_models = compare_models(n_select=3, sort='R2', exclude=['catboost'])
+            # Compare base models using MAE as the metric
+            top_models = compare_models(n_select=3, sort='MAE')
             
-            # Model tuning and ensembling
-            tuned_models = [tune_model(m, optimize='R2') for m in top_models]
-            blended = blend_models(tuned_models)
-            stacked = stack_models(tuned_models)
+            # Tune each selected model for improved performance
+            tuned_models = [tune_model(m, optimize='MAE') for m in top_models]
             
-            self.best_models = [blended, stacked] + tuned_models
+            self.best_models = tuned_models
             
-            # Generate model insights
+            # Save model artifacts for each tuned model
             for i, model in enumerate(self.best_models):
                 self.save_model_artifacts(model, i+1)
             
@@ -383,13 +374,13 @@ def main(train_path, test_path):
         selected_features = selector.select_features(X_processed, y)
         logging.info(f"Selected {len(selected_features)} features: {selected_features}")
         
-        # Model training
+        # Model training using PyCaret Time Series
         logging.info("Training models...")
         trainer = ModelTrainer()
         trainer.setup_environment(train_df, selected_features)
         best_models = trainer.train_models()
         
-        # Model evaluation
+        # Model evaluation on test data using forecast_model
         if Path(test_path).exists():
             logging.info("Evaluating on test data...")
             test_df = pd.read_csv(test_path)
@@ -400,7 +391,6 @@ def main(train_path, test_path):
                 logging.warning(f"Missing features in test data: {missing_features}")
                 logging.info("Using only available features for prediction")
                 
-            # Use intersection of selected features and available features
             test_features = list(set(selected_features) & set(test_df.columns))
             
             if not test_features:
@@ -411,7 +401,9 @@ def main(train_path, test_path):
                 test_df = test_df[test_features]
                 
                 for i, model in enumerate(best_models, 1):
-                    predictions = predict_model(model, data=test_df)
+                    # Set forecast horizon as the number of periods in the test set
+                    fh = len(test_df)
+                    predictions = forecast_model(model, fh=fh)
                     predictions.to_csv(f'data/processed/test_predictions_model_{i}.csv')
                     logging.info(f"Model {i} predictions saved")
         
