@@ -23,17 +23,19 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 import glob
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score, matthews_corrcoef
+from imblearn.metrics import geometric_mean_score
+from sklearn.calibration import calibration_curve
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def configure_paths():
     """Configure directory paths for outputs"""
-    Path("viz/eda").mkdir(parents=True, exist_ok=True)
-    Path("viz/feature_selection").mkdir(parents=True, exist_ok=True)
-    Path("models").mkdir(exist_ok=True)
-    Path("data/processed").mkdir(parents=True, exist_ok=True)
+    Path("viz/eda/classifications").mkdir(parents=True, exist_ok=True)
+    Path("viz/feature_selection/classifications").mkdir(parents=True, exist_ok=True)
+    Path("models/classifications").mkdir(exist_ok=True)
+    Path("data/processed/classifications").mkdir(parents=True, exist_ok=True)
 
 def load_and_analyze_data(file_path):
     """Load and perform comprehensive EDA"""
@@ -232,16 +234,68 @@ class FeatureSelector:
             raise
 
 class ModelTrainer:
-    """Enhanced model training with PyCaret for classification"""
+    """Enhanced model training with PyCaret for classification and imbalance handling"""
     def __init__(self, target_col='target'):
         self.target_col = target_col
         self.best_models = []
         
+    def analyze_class_imbalance(self, data):
+        """Analyze class distribution and recommend resampling strategy"""
+        try:
+            class_dist = data[self.target_col].value_counts()
+            imbalance_ratio = class_dist.min() / class_dist.max()
+            
+            # Create class distribution plot
+            plt.figure(figsize=(10, 6))
+            sns.barplot(x=class_dist.index, y=class_dist.values)
+            plt.title('Class Distribution')
+            plt.xlabel('Class')
+            plt.ylabel('Count')
+            plt.savefig('viz/eda/class_distribution.png')
+            plt.close()
+            
+            # Log imbalance statistics
+            logging.info(f"Class distribution: {class_dist.to_dict()}")
+            logging.info(f"Imbalance ratio: {imbalance_ratio:.3f}")
+            
+            # Recommend sampling strategy
+            if imbalance_ratio < 0.2:
+                return 'severe_imbalance'
+            elif imbalance_ratio < 0.5:
+                return 'moderate_imbalance'
+            else:
+                return 'mild_imbalance'
+                
+        except Exception as e:
+            logging.error(f"Failed to analyze class imbalance: {str(e)}")
+            raise
+    
     def setup_environment(self, data, selected_features=None):
-        """Configure PyCaret with classification settings"""
+        """Configure PyCaret with imbalance handling"""
         try:
             if selected_features:
                 data = data[selected_features + [self.target_col]]
+            
+            # Analyze imbalance
+            imbalance_severity = self.analyze_class_imbalance(data)
+            
+            # Configure fix_imbalance and fix_imbalance_method based on severity
+            fix_imbalance = False
+            fix_imbalance_method = None
+            
+            if imbalance_severity == 'severe_imbalance':
+                fix_imbalance = True
+                # Use SMOTEENN for severe imbalance (combines SMOTE and ENN)
+                fix_imbalance_method = 'smoteenn'
+                logging.info("Using SMOTEENN for severe class imbalance")
+            elif imbalance_severity == 'moderate_imbalance':
+                fix_imbalance = True
+                # Use SMOTE for moderate imbalance
+                fix_imbalance_method = 'smote'
+                logging.info("Using SMOTE for moderate class imbalance")
+            else:
+                # Use class weights for mild imbalance
+                logging.info("Using class weights for mild class imbalance")
             
             exp = setup(
                 data=data, 
@@ -252,6 +306,8 @@ class ModelTrainer:
                 outliers_threshold=0.05,
                 remove_multicollinearity=True,
                 multicollinearity_threshold=0.9,
+                fix_imbalance=fix_imbalance,
+                fix_imbalance_method=fix_imbalance_method,
                 log_experiment=False,
                 experiment_name='agn_classification',
                 use_gpu=False
@@ -264,17 +320,83 @@ class ModelTrainer:
             raise
     
     def train_models(self):
-        """Train and optimize classification models"""
+        """Train and optimize models with imbalance consideration"""
         try:
-            # Compare base models
-            top_models = compare_models(n_select=3, sort='AUC', exclude=['catboost'])
+            # Compare base models using appropriate metrics for imbalanced data
+            top_models = compare_models(
+                n_select=3,
+                sort='AUC',
+                exclude=['catboost', 'qda'],  # Exclude problematic models
+                fold=5,
+                cross_validation=True
+            )
             
-            # Model tuning and ensembling
-            tuned_models = [tune_model(m, optimize='AUC') for m in top_models]
-            blended = blend_models(tuned_models)
-            stacked = stack_models(tuned_models)
+            # Model tuning with focus on minority class
+            tuned_models = []
+            for model in top_models:
+                # Get model name to determine appropriate parameters
+                model_name = model.__class__.__name__.lower()
+                
+                # Define parameter grid based on model type
+                if 'randomforest' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'max_depth': [3, 5, 7, None],
+                        'min_samples_split': [2, 5, 10],
+                        'min_samples_leaf': [1, 2, 4]
+                    }
+                elif 'xgboost' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'max_depth': [3, 5, 7],
+                        'learning_rate': [0.01, 0.1, 0.3],
+                        'subsample': [0.7, 0.8, 0.9]
+                    }
+                elif 'lightgbm' in model_name:
+                    custom_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'num_leaves': [31, 50, 100],
+                        'learning_rate': [0.01, 0.1],
+                        'subsample': [0.7, 0.8, 0.9]
+                    }
+                else:
+                    # Default grid for other models
+                    custom_grid = None
+                
+                # Tune model with appropriate parameters
+                try:
+                    tuned_model = tune_model(
+                        model,
+                        optimize='AUC',
+                        search_algorithm='grid' if custom_grid else 'random',
+                        n_iter=10,
+                        custom_grid=custom_grid,
+                        fold=5
+                    )
+                    tuned_models.append(tuned_model)
+                    logging.info(f"Successfully tuned {model_name}")
+                except Exception as e:
+                    logging.warning(f"Could not tune {model_name}: {str(e)}")
+                    tuned_models.append(model)  # Use untuned model as fallback
             
-            self.best_models = [blended, stacked] + tuned_models
+            # Ensemble methods
+            try:
+                blended = blend_models(
+                    tuned_models,
+                    method='soft',
+                    weights=[1] * len(tuned_models)
+                )
+                
+                stacked = stack_models(
+                    tuned_models,
+                    meta_model='lr',  # Use logistic regression as meta-model
+                    restack=True
+                )
+                
+                self.best_models = [blended, stacked] + tuned_models
+            except Exception as e:
+                logging.warning(f"Could not create ensemble models: {str(e)}")
+                self.best_models = tuned_models
             
             # Generate model insights
             for i, model in enumerate(self.best_models):
@@ -287,19 +409,43 @@ class ModelTrainer:
             raise
     
     def save_model_artifacts(self, model, model_id):
-        """Save classification model artifacts and visualizations"""
+        """Save model artifacts with focus on imbalance metrics"""
         try:
             save_model(model, f'models/model_{model_id}')
             
             Path("viz/models").mkdir(parents=True, exist_ok=True)
             
-            # Classification-specific plots
-            plot_types = ['feature', 'confusion_matrix', 'auc', 'pr']
+            # Classification plots with emphasis on class imbalance
+            plot_types = [
+                'feature',
+                'confusion_matrix',
+                'auc',
+                'pr',  # Precision-Recall curve is crucial for imbalanced data
+                'class_report',  # Detailed per-class metrics
+                'boundary',  # Decision boundary visualization
+                'learning',  # Learning curve to check for bias
+                'calibration'  # Probability calibration curve
+            ]
+            
             for plot_type in plot_types:
                 try:
-                    plot_model(model, plot=plot_type, save=True)
-                    plt.savefig(f'viz/models/model_{model_id}_{plot_type}.png', 
-                               bbox_inches='tight', dpi=300)
+                    plot_model(
+                        model,
+                        plot=plot_type,
+                        save=True,
+                        plot_kwargs={
+                            'display_format': None,
+                            'scale': 1.2,
+                            'plot_kwargs': {
+                                'figsize': (10, 6)
+                            }
+                        }
+                    )
+                    plt.savefig(
+                        f'viz/models/model_{model_id}_{plot_type}.png',
+                        bbox_inches='tight',
+                        dpi=300
+                    )
                     plt.close()
                 except Exception as e:
                     logging.warning(f"Could not generate {plot_type} plot: {str(e)}")
@@ -390,6 +536,9 @@ def main(train_path, test_path):
             logging.info("Evaluating on test data...")
             test_df = pd.read_csv(test_path)
             
+            # Create predictions directory if it doesn't exist
+            Path("predictions").mkdir(exist_ok=True)
+            
             # Check if test data has the required features
             missing_features = set(selected_features) - set(test_df.columns)
             if missing_features:
@@ -410,25 +559,56 @@ def main(train_path, test_path):
                 eval_metrics = pd.DataFrame()
                 
                 for i, model in enumerate(best_models, 1):
-                    predictions = predict_model(model, data=test_df)
-                    
-                    # Save predictions
-                    predictions.to_csv(f'predictions/test_predictions_model_{i}.csv')
-                    
-                    # Calculate and store metrics
-                    metrics = {
-                        'Model': f'model_{i}',
-                        'Accuracy': accuracy_score(predictions['y_true'], predictions['y_pred']),
-                        'AUC': roc_auc_score(predictions['y_true'], predictions['y_pred']),
-                        'F1': f1_score(predictions['y_true'], predictions['y_pred']),
-                        'Precision': precision_score(predictions['y_true'], predictions['y_pred']),
-                        'Recall': recall_score(predictions['y_true'], predictions['y_pred'])
-                    }
-                    eval_metrics = eval_metrics.append(metrics, ignore_index=True)
+                    try:
+                        # Make predictions
+                        predictions = predict_model(model, data=test_df)
+                        
+                        # Log column names for debugging
+                        logging.info(f"Available columns in predictions: {predictions.columns.tolist()}")
+                        
+                        # Try different possible column names for predictions
+                        if 'prediction_label' in predictions.columns:
+                            y_pred = predictions['prediction_label']
+                        elif 'prediction_score' in predictions.columns:
+                            y_pred = predictions['prediction_score']
+                        else:
+                            y_pred = predictions['Label']  # PyCaret's default
+                            
+                        # Save raw predictions
+                        predictions.to_csv(f'predictions/test_predictions_model_{i}.csv', index=False)
+                        
+                        # For evaluation metrics, we'll use only the predictions
+                        metrics = {
+                            'Model': f'model_{i}',
+                            'Positive_Class_Predictions': (y_pred == 1).sum(),
+                            'Negative_Class_Predictions': (y_pred == 0).sum(),
+                            'Prediction_Distribution': y_pred.value_counts().to_dict()
+                        }
+                        
+                        eval_metrics = pd.concat([eval_metrics, pd.DataFrame([metrics])], ignore_index=True)
+                        logging.info(f"Predictions generated and saved for model {i}")
+                        
+                    except Exception as e:
+                        logging.warning(f"Could not generate predictions for model {i}: {str(e)}")
+                        continue
                 
-                # Save evaluation metrics
-                eval_metrics.to_csv('predictions/model_evaluation_metrics.csv', index=False)
-                logging.info("Model evaluation metrics saved")
+                # Save evaluation summary
+                eval_metrics.to_csv('predictions/prediction_distribution.csv', index=False)
+                logging.info("Prediction distribution saved")
+                
+                # Create prediction distribution visualization
+                plt.figure(figsize=(12, 6))
+                for idx, row in eval_metrics.iterrows():
+                    plt.bar(
+                        [f"{row['Model']} - Class {k}" for k in row['Prediction_Distribution'].keys()],
+                        row['Prediction_Distribution'].values()
+                    )
+                plt.title('Prediction Distribution by Model')
+                plt.xticks(rotation=45)
+                plt.ylabel('Count')
+                plt.tight_layout()
+                plt.savefig('viz/models/prediction_distribution.png')
+                plt.close()
         
         # Compile results into PDF
         compile_results_pdf()
